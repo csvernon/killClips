@@ -1,5 +1,6 @@
 package com.killClips;
 
+import com.google.gson.Gson;
 import com.google.inject.Provides;
 import com.killClips.api.StreamableUploader;
 import com.killClips.death.DeathTracker;
@@ -39,6 +40,7 @@ public class KillClipsPlugin extends Plugin
     @Inject private StreamableUploader streamableUploader;
     @Inject private ClientToolbar clientToolbar;
     @Inject private EventBus eventBus;
+    @Inject private Gson gson;
 
     private NavigationButton navBtn;
     private KillClipsPanel sidePanel;
@@ -60,7 +62,7 @@ public class KillClipsPlugin extends Plugin
             inSession = true;
         }
 
-        sidePanel = new KillClipsPanel();
+        sidePanel = new KillClipsPanel(gson);
         streamableUploader.setOnClipUploaded((desc, url) -> sidePanel.addClip(desc, url));
 
         BufferedImage icon = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);

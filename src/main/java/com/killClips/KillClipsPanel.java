@@ -34,15 +34,16 @@ public class KillClipsPanel extends PluginPanel
     private static final Color DELETE_COLOR = new Color(180, 60, 60);
     private static final Color DELETE_HOVER = new Color(220, 80, 80);
 
-    private static final Gson GSON = new Gson();
     private static final Path SAVE_FILE = RuneLite.RUNELITE_DIR.toPath().resolve("kill-clips").resolve("clips.json");
 
+    private final Gson gson;
     private final JPanel clipList;
     private final List<ClipEntry> clips = new ArrayList<>();
 
-    public KillClipsPanel()
+    public KillClipsPanel(Gson gson)
     {
         super(false);
+        this.gson = gson;
         setLayout(new BorderLayout());
         setBackground(ColorScheme.DARK_GRAY_COLOR);
 
@@ -263,7 +264,7 @@ public class KillClipsPanel extends PluginPanel
             {
                 String json = Files.readString(SAVE_FILE, StandardCharsets.UTF_8);
                 Type listType = new TypeToken<List<ClipEntry>>() {}.getType();
-                List<ClipEntry> loaded = GSON.fromJson(json, listType);
+                List<ClipEntry> loaded = gson.fromJson(json, listType);
                 if (loaded != null)
                 {
                     clips.addAll(loaded);
@@ -282,7 +283,7 @@ public class KillClipsPanel extends PluginPanel
         try
         {
             Files.createDirectories(SAVE_FILE.getParent());
-            Files.writeString(SAVE_FILE, GSON.toJson(clips), StandardCharsets.UTF_8);
+            Files.writeString(SAVE_FILE, gson.toJson(clips), StandardCharsets.UTF_8);
         }
         catch (Exception e)
         {

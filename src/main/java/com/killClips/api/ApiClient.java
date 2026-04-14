@@ -4,7 +4,6 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.RuneLite;
 
@@ -82,7 +81,7 @@ public class ApiClient
             if (Files.exists(CLIPS_JSON))
             {
                 String existing = Files.readString(CLIPS_JSON, StandardCharsets.UTF_8);
-                JsonElement parsed = new JsonParser().parse(existing);
+                JsonElement parsed = gson.fromJson(existing, JsonElement.class);
                 clips = (parsed != null && parsed.isJsonArray()) ? parsed.getAsJsonArray() : new JsonArray();
             }
             else
