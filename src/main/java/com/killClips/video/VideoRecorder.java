@@ -58,9 +58,10 @@ public class VideoRecorder
     private static final int ABS_CAP_W = 1920;
     private static final int ABS_CAP_H = 1080;
 
-    // Frame deduplication: skip frames that are very similar to previous (reduces file size)
+    // Frame deduplication: reuse previous JPEG when the new encode is byte-identical.
+    // Only catches truly static frames (menus, afk in empty room) — never collapses real motion.
     private volatile byte[] previousFrameJpeg = null;
-    private static final int DEDUP_SIZE_TOLERANCE = 2048; // bytes — if frame sizes differ by less, compare content
+    private static final int DEDUP_SIZE_TOLERANCE = 2048;
 
     // Box-blur kernel radius for sensitive-content redaction
     private static final int REDACT_RADIUS = 15;
@@ -100,16 +101,13 @@ public class VideoRecorder
     private volatile boolean noGpu = false;
     private volatile boolean gpuMsgSent = false;
 
-    private final H264Encoder h264Encoder;
-
     @Inject
-    public VideoRecorder(DrawManager drawMgr, KillClipsConfig cfg, Client gameClient, ChatMessageManager chatMgr, H264Encoder h264Encoder)
+    public VideoRecorder(DrawManager drawMgr, KillClipsConfig cfg, Client gameClient, ChatMessageManager chatMgr)
     {
         this.drawMgr = drawMgr;
         this.cfg = cfg;
         this.gameClient = gameClient;
         this.chatMgr = chatMgr;
-        this.h264Encoder = h264Encoder;
 
         this.timer = Executors.newScheduledThreadPool(1, r ->
         {
@@ -544,10 +542,9 @@ public class VideoRecorder
             bimg = constrainResolution(bimg, w, h);
             byte[] jpeg = compressJpeg(bimg);
 
-            // Frame deduplication: if this frame is nearly identical to previous, reuse it
+            // Byte-exact dedup: only reuse if the new JPEG encode is identical to the previous one.
             if (!redact && isDuplicateFrame(jpeg))
             {
-                // Reuse previous frame with current timestamp
                 pushToRing(previousFrameJpeg, ts, false);
             }
             else
@@ -560,6 +557,20 @@ public class VideoRecorder
         {
             log.error("Frame processing failed at ts={}", ts, ex);
         }
+    }
+
+    private boolean isDuplicateFrame(byte[] jpeg)
+    {
+        byte[] prev = previousFrameJpeg;
+        if (prev == null || jpeg == null)
+        {
+            return false;
+        }
+        if (Math.abs(jpeg.length - prev.length) > DEDUP_SIZE_TOLERANCE)
+        {
+            return false;
+        }
+        return java.util.Arrays.equals(jpeg, prev);
     }
 
     // Converts bottom-up RGBA pixels (OpenGL convention) into a top-down BufferedImage
@@ -609,25 +620,6 @@ public class VideoRecorder
         g2.drawImage(src, 0, 0, dstW, dstH, null);
         g2.dispose();
         return out;
-    }
-
-    // Checks if a JPEG frame is nearly identical to the previous one.
-    // Compares file sizes first (cheap), then byte content if sizes are close.
-    // When frames are identical (player standing still), this saves ~50KB per dupe.
-    private boolean isDuplicateFrame(byte[] jpeg)
-    {
-        byte[] prev = previousFrameJpeg;
-        if (prev == null || jpeg == null)
-        {
-            return false;
-        }
-        // Different sizes beyond tolerance = definitely different
-        if (Math.abs(jpeg.length - prev.length) > DEDUP_SIZE_TOLERANCE)
-        {
-            return false;
-        }
-        // Same size range — compare bytes (fast for short-circuit on difference)
-        return java.util.Arrays.equals(jpeg, prev);
     }
 
     private byte[] compressJpeg(BufferedImage bimg) throws IOException
@@ -818,19 +810,8 @@ public class VideoRecorder
 
     private String framesToBase64Video(List<byte[]> jpegs) throws IOException
     {
-        int fps = (activeFps > 0) ? activeFps : 30;
-
-        // Try H.264 via jcodec (pure Java, much smaller files)
-        byte[] mp4 = h264Encoder.encode(jpegs, fps);
-        if (mp4 != null)
-        {
-            return Base64.getEncoder().encodeToString(mp4);
-        }
-
-        // Fallback: MJPEG AVI
-        log.warn("H.264 encode failed, falling back to MJPEG AVI");
         byte[] avi = assembleMjpegAvi(jpegs);
-        log.info("MJPEG AVI fallback: {} frames -> {} bytes", jpegs.size(), avi.length);
+        log.info("MJPEG AVI: {} frames -> {} bytes", jpegs.size(), avi.length);
         return Base64.getEncoder().encodeToString(avi);
     }
 

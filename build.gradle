@@ -19,9 +19,6 @@ def pluginMainClass = 'com.killClips.KillClipsPluginTest'
 dependencies {
 	compileOnly group: 'net.runelite', name:'client', version: runeLiteVersion
 
-	implementation 'org.jcodec:jcodec:0.2.5'
-	implementation 'org.jcodec:jcodec-javase:0.2.5'
-
 	compileOnly 'org.projectlombok:lombok:1.18.30'
 	annotationProcessor 'org.projectlombok:lombok:1.18.30'
 
@@ -51,20 +48,9 @@ jar {
 	destinationDirectory.set(layout.buildDirectory.dir('libs'))
 }
 
-// Fat JAR for sideloading only (bundles jcodec). Plugin Hub resolves deps itself.
-tasks.register('sideloadJar', Jar) {
-	archiveFileName.set('kill-clips-sideload.jar')
-	destinationDirectory.set(layout.buildDirectory.dir('libs'))
-	duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-	from sourceSets.main.output
-	from {
-		configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
-	}
-}
-
 tasks.register('deploy', Copy) {
-	dependsOn sideloadJar
-	from tasks.named('sideloadJar').flatMap { it.archiveFile }
+	dependsOn jar
+	from tasks.named('jar').flatMap { it.archiveFile }
 	into "${System.getProperty('user.home')}/.runelite/sideloaded-plugins"
 	rename { 'kill-clips.jar' }
 }
