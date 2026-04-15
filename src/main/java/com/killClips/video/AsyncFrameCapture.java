@@ -185,21 +185,20 @@ public class AsyncFrameCapture
                 ByteBuffer mapped = GL15.glMapBuffer(GL21.GL_PIXEL_PACK_BUFFER, GL15.GL_READ_ONLY);
                 if (mapped != null)
                 {
-                    byte[] copy = new byte[knownW * knownH * 4];
+                    int bytes = knownW * knownH * 4;
+                    byte[] copy = recorder.acquireRgbaBuffer(bytes);
                     mapped.rewind();
-                    mapped.get(copy);
+                    mapped.get(copy, 0, bytes);
                     GL15.glUnmapBuffer(GL21.GL_PIXEL_PACK_BUFFER);
-                    recorder.submitCapturedFrame(ByteBuffer.wrap(copy), knownW, knownH);
+                    recorder.submitCapturedFrame(copy, knownW, knownH);
                 }
-                else
-                {
-                    GL15.glUnmapBuffer(GL21.GL_PIXEL_PACK_BUFFER);
-                }
+                // If mapped is null, the buffer was never mapped — DO NOT call glUnmapBuffer
             }
 
-            // Kick off async readback into the current PBO
+            // Kick off async readback into the current PBO.
+            // GL_BACK is correct for double-buffered contexts; GL_FRONT is undefined on many drivers.
             GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, bufferIds[cur]);
-            GL11.glReadBuffer(GL11.GL_FRONT);
+            GL11.glReadBuffer(GL11.GL_BACK);
             GL11.glReadPixels(0, 0, vpW, vpH, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, 0);
             GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
 

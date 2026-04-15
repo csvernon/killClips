@@ -102,49 +102,87 @@ public class KillClipsPlugin extends Plugin
             clientToolbar.removeNavigation(navBtn);
         }
         streamableUploader.setOnClipUploaded(null);
-        videoRecorder.stopRecording();
+        try
+        {
+            videoRecorder.shutdown();
+        }
+        catch (Exception ex)
+        {
+            log.warn("VideoRecorder shutdown threw", ex);
+        }
         inSession = false;
     }
 
+    // All @Subscribe handlers below are wrapped in try/catch. An uncaught exception here
+    // would detach the subscriber from the event bus for the rest of the session.
+
     private void onGameStateChanged(GameStateChanged evt)
     {
-        GameState gs = evt.getGameState();
-        if (gs == GameState.LOGGED_IN && !inSession)
+        try
         {
-            inSession = true;
+            GameState gs = evt.getGameState();
+            if (gs == GameState.LOGGED_IN && !inSession)
+            {
+                inSession = true;
+            }
+            else if (gs == GameState.LOGIN_SCREEN && inSession)
+            {
+                inSession = false;
+                combatTracker.reset();
+            }
+            else if (gs == GameState.HOPPING && inSession)
+            {
+                inSession = false;
+                combatTracker.reset();
+            }
         }
-        else if (gs == GameState.LOGIN_SCREEN && inSession)
+        catch (Exception ex)
         {
-            inSession = false;
-            combatTracker.reset();
-        }
-        else if (gs == GameState.HOPPING && inSession)
-        {
-            inSession = false;
-            combatTracker.reset();
+            log.warn("onGameStateChanged threw", ex);
         }
     }
 
     private void onInteractingChanged(InteractingChanged evt)
     {
-        combatTracker.onInteractingChanged(evt.getSource(), evt.getTarget());
+        try
+        {
+            combatTracker.onInteractingChanged(evt.getSource(), evt.getTarget());
+        }
+        catch (Exception ex)
+        {
+            log.warn("onInteractingChanged threw", ex);
+        }
     }
 
     private void onActorDeath(ActorDeath evt)
     {
-        Actor who = evt.getActor();
-        if (!(who instanceof Player))
+        try
         {
-            return;
+            Actor who = evt.getActor();
+            if (!(who instanceof Player))
+            {
+                return;
+            }
+            deathTracker.processActorDeath(who);
+            killTracker.processActorDeath(who);
         }
-        deathTracker.processActorDeath(who);
-        killTracker.processActorDeath(who);
+        catch (Exception ex)
+        {
+            log.warn("onActorDeath threw", ex);
+        }
     }
 
     private void onGameTick(GameTick tick)
     {
-        videoRecorder.updateCaptureRateIfNeeded();
-        combatTracker.onGameTick();
+        try
+        {
+            videoRecorder.updateCaptureRateIfNeeded();
+            combatTracker.onGameTick();
+        }
+        catch (Exception ex)
+        {
+            log.warn("onGameTick threw", ex);
+        }
     }
 
     @Provides

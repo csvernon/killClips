@@ -24,7 +24,6 @@ import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -73,9 +72,21 @@ public class VideoRecorder
     private final ChatMessageManager chatMgr;
 
     // -- Thread pools --
-    private final ScheduledExecutorService timer;
-    private final ExecutorService encoderPool;
-    private final ExecutorService serializerPool;
+    private ScheduledExecutorService timer;
+    private ExecutorService encoderPool;
+    private ExecutorService serializerPool;
+
+    // -- Shutdown / lifecycle tracking --
+    private final AtomicBoolean shutDown = new AtomicBoolean(false);
+    // Futures for scheduled assembleClip tasks so we can cancel them on stop
+    private final java.util.Set<java.util.concurrent.ScheduledFuture<?>> pendingAssembly =
+        java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+
+    // -- RGBA buffer pool (reused by AsyncFrameCapture instead of per-frame allocation) --
+    private final java.util.concurrent.ConcurrentLinkedQueue<byte[]> rgbaPool =
+        new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private static final int RGBA_POOL_MAX = 4;
+    private volatile int rgbaPoolSize = 0;
 
     // -- Ring buffer --
     private final byte[][] ringJpeg = new byte[RING_CAPACITY][];
@@ -109,6 +120,12 @@ public class VideoRecorder
         this.gameClient = gameClient;
         this.chatMgr = chatMgr;
 
+        initExecutors();
+        log.debug("Recorder ready (ring capacity={})", computeEffectiveCapacity());
+    }
+
+    private void initExecutors()
+    {
         this.timer = Executors.newScheduledThreadPool(1, r ->
         {
             Thread th = new Thread(r, "KillClips-Scheduler");
@@ -127,8 +144,73 @@ public class VideoRecorder
             th.setDaemon(true);
             return th;
         });
+    }
 
-        log.debug("Recorder ready (ring capacity={})", computeEffectiveCapacity());
+    // Full teardown: cancel pending work, shut down executors, release the buffer pool.
+    // Called from the plugin's shutDown hook. Idempotent.
+    public void shutdown()
+    {
+        if (shutDown.getAndSet(true))
+        {
+            return;
+        }
+        stopRecording();
+        pendingAssembly.forEach(f -> f.cancel(false));
+        pendingAssembly.clear();
+
+        safeShutdown(timer);
+        safeShutdown(encoderPool);
+        safeShutdown(serializerPool);
+
+        rgbaPool.clear();
+        rgbaPoolSize = 0;
+        log.debug("VideoRecorder shut down");
+    }
+
+    private static void safeShutdown(ExecutorService es)
+    {
+        if (es == null) return;
+        try
+        {
+            es.shutdown();
+            if (!es.awaitTermination(2, TimeUnit.SECONDS))
+            {
+                es.shutdownNow();
+            }
+        }
+        catch (InterruptedException ex)
+        {
+            es.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // Acquire a reusable RGBA buffer sized exactly to `bytes`. Called from the GL thread —
+    // avoids allocating up to 8MB per frame at 1080p/30fps (~240MB/sec of GC pressure).
+    public byte[] acquireRgbaBuffer(int bytes)
+    {
+        byte[] b = rgbaPool.poll();
+        if (b != null)
+        {
+            rgbaPoolSize--;
+            if (b.length == bytes)
+            {
+                return b;
+            }
+            // Size mismatch (viewport changed) — drop this one, allocate fresh
+        }
+        return new byte[bytes];
+    }
+
+    // Return a buffer to the pool once the encoder is finished with it.
+    void releaseRgbaBuffer(byte[] buf)
+    {
+        if (buf == null) return;
+        if (rgbaPoolSize < RGBA_POOL_MAX)
+        {
+            rgbaPool.offer(buf);
+            rgbaPoolSize++;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -171,28 +253,44 @@ public class VideoRecorder
         return inflightEncodes.get() < ENCODE_CONCURRENCY_LIMIT;
     }
 
-    // Accepts raw RGBA pixels from the PBO readback and schedules encoding
-    void submitCapturedFrame(ByteBuffer rgba, int w, int h)
+    // Accepts raw RGBA pixels from the PBO readback and schedules encoding.
+    // `rgbaArray` is a byte[] owned by the buffer pool — we return it after use.
+    void submitCapturedFrame(byte[] rgbaArray, int w, int h)
     {
+        if (shutDown.get() || !recording.get())
+        {
+            releaseRgbaBuffer(rgbaArray);
+            return;
+        }
         long now = System.currentTimeMillis();
         boolean redact = fetchSensitiveFlag(now);
 
         inflightEncodes.incrementAndGet();
-        encoderPool.submit(() ->
+        try
         {
-            try
+            encoderPool.submit(() ->
             {
-                processRawFrame(rgba, w, h, now, redact);
-            }
-            catch (Exception ex)
-            {
-                log.error("Frame encoding failed", ex);
-            }
-            finally
-            {
-                inflightEncodes.decrementAndGet();
-            }
-        });
+                try
+                {
+                    processRawFrame(rgbaArray, w, h, now, redact);
+                }
+                catch (Exception ex)
+                {
+                    log.error("Frame encoding failed", ex);
+                }
+                finally
+                {
+                    releaseRgbaBuffer(rgbaArray);
+                    inflightEncodes.decrementAndGet();
+                }
+            });
+        }
+        catch (java.util.concurrent.RejectedExecutionException ex)
+        {
+            // Pool was shut down between our check and submit; drop the frame
+            releaseRgbaBuffer(rgbaArray);
+            inflightEncodes.decrementAndGet();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -346,6 +444,12 @@ public class VideoRecorder
 
     public void startRecording()
     {
+        if (shutDown.get())
+        {
+            // Plugin was re-enabled after a full shutdown — bring executors back
+            shutDown.set(false);
+            initExecutors();
+        }
         if (recording.getAndSet(true))
         {
             return;
@@ -371,10 +475,18 @@ public class VideoRecorder
             return;
         }
 
-        if (gpuCapture != null)
+        // Cancel any pending scheduled assembleClip tasks so they don't fire after shutdown
+        pendingAssembly.forEach(f -> f.cancel(false));
+        pendingAssembly.clear();
+        postEventActive.set(false);
+
+        synchronized (ringLock)
         {
-            gpuCapture.stop();
-            gpuCapture = null;
+            if (gpuCapture != null)
+            {
+                gpuCapture.stop();
+                gpuCapture = null;
+            }
         }
 
         resetRing();
@@ -382,7 +494,7 @@ public class VideoRecorder
         activeFps = 0;
     }
 
-    private void handleGpuMissing()
+    private synchronized void handleGpuMissing()
     {
         log.debug("GPU unavailable -- disabling video capture");
         if (gpuCapture != null)
@@ -395,15 +507,12 @@ public class VideoRecorder
         noGpu = true;
     }
 
-    // Detects quality/mode changes and adjusts the live capture accordingly
-    public void updateCaptureRateIfNeeded()
+    // Detects quality/mode changes and adjusts the live capture accordingly.
+    // Synchronized because gpuCapture may be replaced, and the GL thread concurrently
+    // calls back via submitCapturedFrame.
+    public synchronized void updateCaptureRateIfNeeded()
     {
-        if (postEventActive.get())
-        {
-            return;
-        }
-
-        if (noGpu)
+        if (shutDown.get() || postEventActive.get() || noGpu)
         {
             return;
         }
@@ -488,49 +597,88 @@ public class VideoRecorder
         long windowStart = eventTime - preMs;
         long windowEnd = eventTime + postMs;
 
-        timer.schedule(() ->
+        try
+        {
+            final java.util.concurrent.ScheduledFuture<?>[] holder = new java.util.concurrent.ScheduledFuture<?>[1];
+            holder[0] = timer.schedule(() ->
+            {
+                pendingAssembly.remove(holder[0]);
+                postEventActive.set(false);
+                // Bail out if the plugin was stopped during the post-event wait
+                if (shutDown.get())
+                {
+                    return;
+                }
+                try
+                {
+                    if (onEncodingStart != null)
+                    {
+                        onEncodingStart.run();
+                    }
+                    assembleClip(cb, windowStart, windowEnd);
+                }
+                catch (Exception ex)
+                {
+                    log.error("Post-event assembly failed", ex);
+                }
+            }, postMs, TimeUnit.MILLISECONDS);
+            pendingAssembly.add(holder[0]);
+        }
+        catch (java.util.concurrent.RejectedExecutionException ex)
         {
             postEventActive.set(false);
-            if (onEncodingStart != null)
-            {
-                onEncodingStart.run();
-            }
-            assembleClip(cb, windowStart, windowEnd);
-        }, postMs, TimeUnit.MILLISECONDS);
+            log.debug("Scheduler rejected post-event task (shutdown in progress)");
+        }
     }
 
     // Grabs a single frame for events that do not need video
     public void captureScreenshotOnly(VideoCallback cb)
     {
+        if (shutDown.get())
+        {
+            return;
+        }
         boolean redact = querySensitiveWidgets();
 
         drawMgr.requestNextFrameListener(img ->
-            encoderPool.submit(() ->
+        {
+            if (shutDown.get())
             {
-                try
+                return;
+            }
+            try
+            {
+                encoderPool.submit(() ->
                 {
-                    BufferedImage shot = ImageUtil.bufferedImageFromImage(img);
-                    if (redact)
+                    try
                     {
-                        shot = redactImage(shot);
+                        BufferedImage shot = ImageUtil.bufferedImageFromImage(img);
+                        if (redact)
+                        {
+                            shot = redactImage(shot);
+                        }
+                        String b64 = bufferedImageToPngBase64(shot);
+                        safeInvoke(cb, b64, null);
                     }
-                    String b64 = bufferedImageToPngBase64(shot);
-                    cb.onComplete(b64, null);
-                }
-                catch (Exception ex)
-                {
-                    log.error("Screenshot capture failed", ex);
-                    cb.onComplete(null, null);
-                }
-            })
-        );
+                    catch (Exception ex)
+                    {
+                        log.error("Screenshot capture failed", ex);
+                        safeInvoke(cb, null, null);
+                    }
+                });
+            }
+            catch (java.util.concurrent.RejectedExecutionException rex)
+            {
+                // Pool shut down
+            }
+        });
     }
 
     // ------------------------------------------------------------------
     //  Frame encoding pipeline
     // ------------------------------------------------------------------
 
-    private void processRawFrame(ByteBuffer rgba, int w, int h, long ts, boolean redact)
+    private void processRawFrame(byte[] rgba, int w, int h, long ts, boolean redact)
     {
         try
         {
@@ -574,11 +722,11 @@ public class VideoRecorder
     }
 
     // Converts bottom-up RGBA pixels (OpenGL convention) into a top-down BufferedImage
-    private BufferedImage rgbaToBufferedImage(ByteBuffer rgba, int w, int h)
+    private BufferedImage rgbaToBufferedImage(byte[] rgba, int w, int h)
     {
         BufferedImage bimg = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
-        rgba.rewind();
         int stride = w * 4;
+        int[] row = new int[w];
 
         for (int destY = 0; destY < h; destY++)
         {
@@ -587,11 +735,12 @@ public class VideoRecorder
             for (int x = 0; x < w; x++)
             {
                 int off = rowBase + x * 4;
-                int red = rgba.get(off) & 0xFF;
-                int grn = rgba.get(off + 1) & 0xFF;
-                int blu = rgba.get(off + 2) & 0xFF;
-                bimg.setRGB(x, destY, (red << 16) | (grn << 8) | blu);
+                int red = rgba[off] & 0xFF;
+                int grn = rgba[off + 1] & 0xFF;
+                int blu = rgba[off + 2] & 0xFF;
+                row[x] = (red << 16) | (grn << 8) | blu;
             }
+            bimg.setRGB(0, destY, w, 1, row, 0, w);
         }
         return bimg;
     }
@@ -687,48 +836,90 @@ public class VideoRecorder
 
     private void assembleClip(VideoCallback cb, long tStart, long tEnd)
     {
+        if (shutDown.get())
+        {
+            return;
+        }
         boolean redact = querySensitiveWidgets();
 
         drawMgr.requestNextFrameListener(img ->
-            encoderPool.submit(() ->
+        {
+            if (shutDown.get())
             {
-                try
+                return;
+            }
+            try
+            {
+                encoderPool.submit(() ->
                 {
-                    BufferedImage shot = ImageUtil.bufferedImageFromImage(img);
-                    if (redact)
+                    try
                     {
-                        shot = redactImage(shot);
-                    }
-                    String screenshotB64 = bufferedImageToPngBase64(shot);
+                        BufferedImage shot = ImageUtil.bufferedImageFromImage(img);
+                        if (redact)
+                        {
+                            shot = redactImage(shot);
+                        }
+                        String screenshotB64 = bufferedImageToPngBase64(shot);
 
-                    FrameBatch batch = extractFrames(tStart, tEnd);
-                    if (batch == null || batch.jpegList.isEmpty())
-                    {
-                        cb.onComplete(screenshotB64, null);
-                        return;
-                    }
+                        FrameBatch batch = extractFrames(tStart, tEnd);
+                        if (batch == null || batch.jpegList.isEmpty())
+                        {
+                            safeInvoke(cb, screenshotB64, null);
+                            return;
+                        }
 
-                    serializerPool.submit(() ->
-                    {
                         try
                         {
-                            String videoB64 = framesToBase64Video(batch.jpegList);
-                            cb.onComplete(screenshotB64, videoB64);
+                            serializerPool.submit(() ->
+                            {
+                                try
+                                {
+                                    byte[] video = framesToVideoBytes(batch.jpegList);
+                                    // Free the frame list before invoking the callback
+                                    // so its byte[] references become collectible
+                                    batch.jpegList = null;
+                                    safeInvoke(cb, screenshotB64, video);
+                                }
+                                catch (Exception ex)
+                                {
+                                    log.error("AVI serialization failed", ex);
+                                    safeInvoke(cb, screenshotB64, null);
+                                }
+                            });
                         }
-                        catch (Exception ex)
+                        catch (java.util.concurrent.RejectedExecutionException rex)
                         {
-                            log.error("AVI serialization failed", ex);
-                            cb.onComplete(screenshotB64, null);
+                            safeInvoke(cb, screenshotB64, null);
                         }
-                    });
-                }
-                catch (Exception ex)
-                {
-                    log.error("Clip assembly failed", ex);
-                    cb.onComplete(null, null);
-                }
-            })
-        );
+                    }
+                    catch (Exception ex)
+                    {
+                        log.error("Clip assembly failed", ex);
+                        safeInvoke(cb, null, null);
+                    }
+                });
+            }
+            catch (java.util.concurrent.RejectedExecutionException rex)
+            {
+                // Encoder pool is shut down; nothing we can do
+            }
+        });
+    }
+
+    private void safeInvoke(VideoCallback cb, String screenshotB64, byte[] video)
+    {
+        if (cb == null || shutDown.get())
+        {
+            return;
+        }
+        try
+        {
+            cb.onComplete(screenshotB64, video);
+        }
+        catch (Exception ex)
+        {
+            log.error("VideoCallback threw", ex);
+        }
     }
 
     // Snapshot + apply deferred blur for frames in the time window
@@ -808,11 +999,11 @@ public class VideoRecorder
     //  MJPEG AVI builder
     // ------------------------------------------------------------------
 
-    private String framesToBase64Video(List<byte[]> jpegs) throws IOException
+    private byte[] framesToVideoBytes(List<byte[]> jpegs) throws IOException
     {
         byte[] avi = assembleMjpegAvi(jpegs);
         log.info("MJPEG AVI: {} frames -> {} bytes", jpegs.size(), avi.length);
-        return Base64.getEncoder().encodeToString(avi);
+        return avi;
     }
 
     private byte[] assembleMjpegAvi(List<byte[]> jpegs) throws IOException
@@ -1015,6 +1206,10 @@ public class VideoRecorder
 
     public interface VideoCallback
     {
-        void onComplete(String screenshotBase64, String videoKey);
+        /**
+         * @param screenshotBase64 PNG-encoded still, base64 string (small, ~100KB)
+         * @param videoBytes       raw MJPEG AVI bytes, or null if video unavailable
+         */
+        void onComplete(String screenshotBase64, byte[] videoBytes);
     }
 }

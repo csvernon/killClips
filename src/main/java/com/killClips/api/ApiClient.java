@@ -14,7 +14,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.Base64;
 
 @Slf4j
 @Singleton
@@ -34,7 +33,7 @@ public class ApiClient
         this.streamable = streamable;
     }
 
-    public void sendEventToApi(String endpoint, String jsonBody, String label, String videoB64)
+    public void sendEventToApi(String endpoint, String jsonBody, String label, byte[] videoBytes)
     {
         try
         {
@@ -46,13 +45,13 @@ public class ApiClient
             meta.addProperty("event_type", kind);
             meta.addProperty("saved_at", LocalDateTime.now().toString());
 
-            String player = meta.has("playername") ? meta.get("playername").getAsString() : "unknown";
+            String rawPlayer = meta.has("playername") ? meta.get("playername").getAsString() : "unknown";
+            String player = sanitizePathSegment(rawPlayer);
             Path folder = RuneLite.RUNELITE_DIR.toPath().resolve("videos").resolve(player).resolve(kind);
             Files.createDirectories(folder);
 
-            if (videoB64 != null && !videoB64.isEmpty())
+            if (videoBytes != null && videoBytes.length > 0)
             {
-                byte[] videoBytes = Base64.getDecoder().decode(videoB64);
                 String ext = (videoBytes.length >= 8 && "ftyp".equals(new String(videoBytes, 4, 4, StandardCharsets.US_ASCII))) ? ".mp4" : ".avi";
                 Path vidPath = folder.resolve(stem + ext);
                 Files.write(vidPath, videoBytes);
@@ -69,6 +68,26 @@ public class ApiClient
         {
             log.error("Failed to persist {}", label, ex);
         }
+    }
+
+    // Keep only letters, digits, underscore, dash, and space — prevents any path-traversal
+    // (.. or / or \) if a malformed player name ever reaches this code path.
+    private static String sanitizePathSegment(String raw)
+    {
+        if (raw == null || raw.isEmpty())
+        {
+            return "unknown";
+        }
+        String cleaned = raw.replaceAll("[^a-zA-Z0-9 _-]", "_").trim();
+        if (cleaned.isEmpty() || ".".equals(cleaned) || "..".equals(cleaned))
+        {
+            return "unknown";
+        }
+        if (cleaned.length() > 32)
+        {
+            cleaned = cleaned.substring(0, 32);
+        }
+        return cleaned;
     }
 
     private synchronized void appendToClipsJson(JsonObject entry)

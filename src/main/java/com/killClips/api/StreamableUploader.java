@@ -19,6 +19,7 @@ import javax.inject.Singleton;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 
 @Slf4j
@@ -38,7 +39,13 @@ public class StreamableUploader
     @Inject
     public StreamableUploader(OkHttpClient http, KillClipsConfig cfg, Gson gson)
     {
-        this.http = http;
+        // Override the shared RuneLite client's timeouts so uploads never hang forever.
+        this.http = http.newBuilder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .writeTimeout(5, TimeUnit.MINUTES)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .callTimeout(10, TimeUnit.MINUTES)
+            .build();
         this.cfg = cfg;
         this.gson = gson;
     }
@@ -71,10 +78,9 @@ public class StreamableUploader
 
         try
         {
-            byte[] content = Files.readAllBytes(clip);
             String name = clip.getFileName().toString();
-
-            RequestBody filePart = RequestBody.create(BINARY, content);
+            // Stream the file from disk instead of loading it into memory
+            RequestBody filePart = RequestBody.create(BINARY, clip.toFile());
             MultipartBody payload = new MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
                 .addFormDataPart("file", name, filePart)
@@ -131,9 +137,9 @@ public class StreamableUploader
                 }
             });
         }
-        catch (IOException ex)
+        catch (Exception ex)
         {
-            log.error("Could not read video for Streamable upload: {}", clip, ex);
+            log.error("Could not prepare Streamable upload: {}", clip, ex);
         }
     }
 }

@@ -49,7 +49,7 @@ public class DeathTracker
     private void captureAndStore()
     {
         recorder.captureEventVideo(
-            (screenshotData, videoData) ->
+            (screenshotData, videoBytes) ->
             {
                 String rsn = resolvePlayerName();
 
@@ -61,7 +61,7 @@ public class DeathTracker
                     "/api/webhooks/death",
                     info.toString(),
                     "death",
-                    videoData
+                    videoBytes
                 );
             },
             null,

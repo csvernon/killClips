@@ -64,7 +64,7 @@ public class KillTracker
     private void captureAndStore(String victim)
     {
         recorder.captureEventVideo(
-            (screenshotData, videoData) ->
+            (screenshotData, videoBytes) ->
             {
                 String myName = resolvePlayerName();
 
@@ -77,7 +77,7 @@ public class KillTracker
                     "/api/webhooks/kills",
                     info.toString(),
                     "kill",
-                    videoData
+                    videoBytes
                 );
             },
             null,
